@@ -1,15 +1,18 @@
-from flask import Flask,
-request 
-app = Flask(__name__) 
+from flask import Flask, request
+
+app=Flask(_name_)
 @app.route("/")
 def home():
     return "UFE Running"
-@app.route("/webhook",
-methods=["POST"])
+
+@app.route("/webhook", methods=["POST"])
+6
 def webhook():
-    print("Headers:",
-request.headers)
-    print("Raw Data:",
-request.data)
-    return {"status":
-"received"}, 200
+7
+print("Headers:", request.headers)
+8
+print("Raw Data:", request.data)
+9
+ 
+10
+return {"status": "received"}, 200
