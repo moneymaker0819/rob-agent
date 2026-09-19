@@ -1,25 +1,13 @@
 from flask import Flask, request
-2
- 
-3
+
 app = Flask(__name__)
-4
- 
-5
+
 @app.route("/")
-6
 def home():
-7
-return "UFE Running"
-8
- 
-9
+    return "UFE Running"
+
 @app.route("/webhook", methods=["POST"])
-10
 def webhook():
-11
-data = request.json
-12
-print(data)
-13
-return {"status": "received"}
+    data = request.json
+    print(data)
+    return {"status": "received"}
