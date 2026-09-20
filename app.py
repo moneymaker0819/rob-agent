@@ -1,3 +1,5 @@
+Python
+1
 import os
 2
 from flask import Flask, request
@@ -10,86 +12,74 @@ app = Flask(__name__)
 6
  
 7
-# Connect to Alpaca Paper Trading
-8
 api = tradeapi.REST(
-9
+8
 os.environ["APCA_API_KEY_ID"],
-10
+9
 os.environ["APCA_API_SECRET_KEY"],
-11
+10
 "https://paper-api.alpaca.markets",
-12
+11
 api_version="v2"
+12
+)
 13
-)
+ 
 14
- 
-15
 @app.route("/")
-16
+15
 def home():
-17
+16
 return "Rob Agent Running", 200
+17
+ 
 18
- 
-19
- 
-20
 @app.route("/webhook", methods=["POST"])
-21
+19
 def webhook():
-22
- 
-23
+20
 payload = request.get_json(silent=True)
-24
+21
  
-25
+22
 print("JSON Data:", payload)
-26
+23
  
-27
+24
 if payload:
-28
- 
-29
+25
 symbol = payload.get("symbol")
-30
+26
 action = payload.get("action")
-31
+27
  
-32
+28
 if action == "BUY":
-33
- 
-34
+29
 api.submit_order(
-35
+30
 symbol=symbol,
-36
+31
 qty=1,
-37
+32
 side="buy",
-38
+33
 type="market",
-39
+34
 time_in_force="gtc"
-40
+35
 )
-41
+36
  
-42
+37
 print(f"BUY order submitted for {symbol}")
-43
+38
  
-44
+39
 return {"status": "received"}, 200
-45
+40
  
-46
- 
-47
+41
 if __name__ == "__main__":
-48
+42
 app.run(host="0.0.0.0", port=5000)
