@@ -6,13 +6,24 @@ orders to Alpaca. The account (paper vs live) is chosen by ALPACA_PAPER.
 
 Deployment notes
 ----------------
-* Nothing here calls get_json(); the body is parsed from raw bytes, so
-  TradingView's wrong/missing Content-Type header is irrelevant. This is
-  the fix for a 415 returned by the earlier handler.
-* The shared secret is never written to the logs. Do not re-add a raw-body
-  or header dump.
-* Crypto is 24/7 and uses GTC + fractional qty; equities are session-bound,
-  DAY, whole shares. Both live in this one code path.
+* The request body is parsed from raw bytes rather than through Flask's JSON
+  helper, so TradingView's wrong or missing Content-Type header cannot produce
+  a 415. Flask's parser refuses anything that is not application/json;
+  TradingView frequently sends text/plain or nothing at all.
+* The shared secret is never written to the logs. Do not re-add a raw-body or
+  header dump: the body carries the credential.
+* Crypto trades 24/7 and uses GTC with fractional quantity; equities are
+  session-bound, DAY, whole shares. Both live in this one code path.
+
+Required environment:
+    ALPACA_API_KEY           (or ALPACA_PAPER_API_KEY / ALPACA_LIVE_API_KEY)
+    ALPACA_SECRET_KEY        (or the per-environment equivalents)
+    WEBHOOK_SECRET           must match the value in the TradingView payload
+
+Optional environment:
+    ALPACA_PAPER             "false" disables paper mode; anything else is paper
+    ALLOWED_SYMBOLS          comma-separated override of the built-in allowlist
+    PORT                     listen port, default 5000
 """
 
 import hashlib
@@ -40,9 +51,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# --- Environment -------------------------------------------------------------
+# =============================================================================
+# ENVIRONMENT
+# =============================================================================
 
 def _require_env(name: str) -> str:
+    """Read a variable that must be present, failing loudly at import."""
     value = os.environ.get(name, "").strip()
     if not value:
         raise RuntimeError(f"Required environment variable {name} is missing")
@@ -53,14 +67,14 @@ def _optional_env(name: str) -> str:
     return os.environ.get(name, "").strip()
 
 
-# Paper unless explicitly disabled. Only the literal string "false" (case
-# insensitive) turns it off, so a typo like ALPACA_PAPER=0 stays in paper.
+# Paper unless explicitly disabled. Only the literal string "false" turns it
+# off, so a typo such as ALPACA_PAPER=0 or ALPACA_PAPER=no stays in paper.
 ALPACA_PAPER = _optional_env("ALPACA_PAPER").lower() != "false"
 ENV_LABEL = "PAPER" if ALPACA_PAPER else "LIVE"
 
-# Prefer per-environment credential pairs so a live key can never sit in the
-# paper deployment's environment waiting for one variable to flip. Fall back
-# to the generic names for a single-environment setup.
+# Per-environment credential pairs take precedence, so a live key never has to
+# sit in the paper deployment's environment waiting for one variable to flip.
+# The generic names remain the fallback for a single-environment setup.
 if ALPACA_PAPER:
     ALPACA_API_KEY = _optional_env("ALPACA_PAPER_API_KEY") or _require_env("ALPACA_API_KEY")
     ALPACA_SECRET_KEY = _optional_env("ALPACA_PAPER_SECRET_KEY") or _require_env("ALPACA_SECRET_KEY")
@@ -83,15 +97,23 @@ logger.warning(
 logger.warning("=" * 66)
 
 
-# --- Configuration -----------------------------------------------------------
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
 
 MAX_BODY_BYTES = 64 * 1024
+DEFAULT_QTY = 1
+MAX_QTY = 100
+MAX_NOTIONAL = 50_000         # per-order USD cap for notional-sized orders
+MAX_REQUESTS_PER_MINUTE = 30  # in-process backstop, see _rate_limited()
+MISSING_ORDER_STATUS = 404
 
-# Allowlist: 16 equities + 11 crypto pairs. Everything else is rejected.
+# Allowlist: 16 equities + 11 crypto pairs. Everything else is rejected before
+# any call reaches Alpaca.
 #
-# VOO is deliberately absent: it holds substantially the same constituents as
-# SPY, so a Pine script firing on both is one position reported twice rather
-# than two. VTI (total market, adds mid/small cap) and IWM carry the breadth.
+# VOO is deliberately absent. It holds substantially the same constituents as
+# SPY, so a script firing on both is one position reported twice rather than
+# two. VTI (total market, adds mid and small cap) and IWM carry the breadth.
 ALLOWED_SYMBOLS = {
     # --- Equities (16) ---
     "SPY",    # SPDR S&P 500 ETF
@@ -124,27 +146,20 @@ ALLOWED_SYMBOLS = {
     "AAVE/USD",  # Aave
 }
 
-# Symbols that may never be traded even if listed.
+# Symbols that may never be traded even if listed above.
 DENIED_SYMBOLS = set()
 
-# Per-symbol direction restriction. A symbol named here accepts only the sides
-# listed. SQQQ is BUY-only: a SELL reads like "close my position" but is a
-# short of a short on a fund that rebalances daily, and the drift is ugly.
+# Per-symbol direction restriction: a symbol named here accepts only the sides
+# listed. SQQQ is BUY-only because a SELL reads like "close my position" but is
+# a short of a short on a fund that rebalances daily, and the drift is ugly.
 DIRECTION_RESTRICTIONS = {
     "SQQQ": {"BUY"},
 }
 
-DEFAULT_QTY = 1
-MAX_QTY = 100
-MAX_NOTIONAL = 50_000        # per-order USD cap for notional-sized orders
-MAX_REQUESTS_PER_MINUTE = 30  # in-process backstop, see _rate_limited()
-
-MISSING_ORDER_STATUS = 404
-
-# Equities (BRK.B, RDS-A, SPY) and crypto pairs (BTC/USD).
+# Equities may write BRK.B or RDS-A; crypto pairs are written BTC/USD.
 _SYMBOL_RE = re.compile(r"(?:[A-Z][A-Z0-9.\-]{0,14}|[A-Z]{2,10}/[A-Z]{2,10})")
 
-# Quote currencies TradingView may glue onto a crypto ticker (BTCUSD).
+# Quote currencies a glued crypto ticker may end with (BTCUSD, BTCUSDT).
 _QUOTE_SUFFIXES = ("USDT", "USDC", "USD", "EUR")
 
 # Optional comma-separated override, e.g. ALLOWED_SYMBOLS=SPY,QQQ,BTC/USD
@@ -153,7 +168,9 @@ if _override:
     ALLOWED_SYMBOLS = {s.strip() for s in _override.split(",") if s.strip()}
 
 
-# --- Symbol normalization (TradingView -> Alpaca) ----------------------------
+# =============================================================================
+# SYMBOL NORMALIZATION (TradingView -> Alpaca)
+# =============================================================================
 
 def normalize_symbol(raw: str) -> str:
     """
@@ -164,9 +181,9 @@ def normalize_symbol(raw: str) -> str:
         CRYPTO:BTCUSD -> BTC/USD
         BTC/USD       -> BTC/USD  (unchanged)
 
-    Falls back to the stripped, upper-cased input. The allowlist check is what
-    finally rejects anything unrecognised, so an unmapped ticker fails there
-    rather than being silently rewritten.
+    The stripped, upper-cased input is returned when no rule applies. The
+    allowlist check is what finally rejects an unrecognised ticker, so nothing
+    is rewritten speculatively.
     """
     sym = raw.strip().upper()
 
@@ -179,7 +196,7 @@ def normalize_symbol(raw: str) -> str:
         return sym
 
     # Crypto arrives glued: BTCUSD -> BTC/USD. Only rewrite when the candidate
-    # is already allowlisted, so 'SPY' can never be mangled into 'SP/Y'.
+    # is already allowlisted, so SPY can never be mangled into SP/Y.
     for quote in _QUOTE_SUFFIXES:
         if sym.endswith(quote) and len(sym) > len(quote):
             candidate = f"{sym[: -len(quote)]}/{quote}"
@@ -189,13 +206,16 @@ def normalize_symbol(raw: str) -> str:
     return sym
 
 
-# --- Idempotency -------------------------------------------------------------
+# =============================================================================
+# IDEMPOTENCY
+# =============================================================================
 
 def make_client_order_id(signal_id: str) -> str:
     """
-    Deterministic idempotency key. Hashed rather than truncated, so two
-    different signal_ids cannot collide down to the same key. Alpaca caps
-    client_order_id at 48 characters.
+    Deterministic idempotency key.
+
+    Hashed rather than truncated so two different signal_ids cannot collide
+    onto the same key. Alpaca caps client_order_id at 48 characters.
     """
     digest = hashlib.sha256(signal_id.encode("utf-8")).hexdigest()
     return ("tv-" + digest)[:48]
@@ -203,9 +223,12 @@ def make_client_order_id(signal_id: str) -> str:
 
 def is_missing_order_error(exc: APIError) -> bool:
     """
-    True only when Alpaca affirmatively says 'no order with that
-    client_order_id'. Match the status code, never message text: a 500 whose
-    body happens to contain 'not found' must not read as safe-to-submit.
+    True only when Alpaca affirmatively reports no order for that
+    client_order_id.
+
+    The status code is the test, never the message text. A 500 or 429 whose
+    body happens to contain the words "not found" must not be read as
+    safe-to-submit, or an ambiguous lookup becomes a second live order.
     """
     status = getattr(exc, "status_code", None)
     if status is None:
@@ -214,7 +237,9 @@ def is_missing_order_error(exc: APIError) -> bool:
     return status == MISSING_ORDER_STATUS
 
 
-# --- Rate limiting -----------------------------------------------------------
+# =============================================================================
+# RATE LIMITING
+# =============================================================================
 
 _rate_lock = threading.Lock()
 _recent_hits: deque = deque()
@@ -222,11 +247,11 @@ _recent_hits: deque = deque()
 
 def _rate_limited(now: float) -> bool:
     """
-    Simple sliding-window limiter.
+    Sliding-window limiter over the last 60 seconds.
 
-    Scope: this process only. It does NOT coordinate across gunicorn workers
-    or across restarts, so treat it as a backstop against an alert loop, not
-    as a guarantee. A real per-account ceiling belongs in shared storage.
+    Scope is this process only. It does not coordinate across gunicorn workers
+    or survive a restart, so treat it as a backstop against an alert loop
+    rather than a guarantee. A real per-account ceiling needs shared storage.
     """
     cutoff = now - 60.0
     with _rate_lock:
@@ -238,7 +263,9 @@ def _rate_limited(now: float) -> bool:
         return False
 
 
-# --- Helpers -----------------------------------------------------------------
+# =============================================================================
+# VALIDATION HELPERS
+# =============================================================================
 
 def _bad_request(message: str, code: int = 400):
     return jsonify(error=message), code
@@ -248,13 +275,13 @@ def _parse_size(payload: dict, is_crypto: bool):
     """
     Returns (kwargs, error_response). Accepts qty or notional, never both.
 
-    Parsed as float first so a fractional equity qty is *rejected* rather than
-    silently truncated by int(1.5) == 1, which would quietly fill the wrong
-    size instead of telling you the payload was wrong.
+    Parsed as float first so a fractional equity quantity is rejected rather
+    than silently truncated by int(1.5) == 1, which would fill the wrong size
+    and report success.
 
-    math.isfinite() guards NaN and infinity: NaN compares False against both
-    <=0 and >MAX_QTY, so without this it would sail past the range check and
-    reach the order request.
+    math.isfinite guards NaN and infinity. NaN compares False against both
+    <= 0 and > MAX_QTY, so without it NaN would pass the range check and reach
+    the order request.
     """
     has_qty = payload.get("qty") is not None
     has_notional = payload.get("notional") is not None
@@ -269,7 +296,7 @@ def _parse_size(payload: dict, is_crypto: bool):
             return None, _bad_request("notional must be a number")
         if not math.isfinite(notional):
             return None, _bad_request("notional must be a finite number")
-        if not (1 <= notional <= MAX_NOTIONAL):
+        if not 1 <= notional <= MAX_NOTIONAL:
             return None, _bad_request(
                 f"notional must be between 1 and {MAX_NOTIONAL}"
             )
@@ -297,8 +324,8 @@ def _parse_size(payload: dict, is_crypto: bool):
 
 def resolve_asset(symbol: str):
     """
-    Live confirmation the symbol exists, is active and is tradable on this
-    account. Returns (asset, error_response).
+    Confirm against Alpaca that the symbol exists, is active, and is tradable
+    on this account. Returns (asset, error_response).
     """
     try:
         asset = api.get_asset(symbol)
@@ -319,11 +346,13 @@ def resolve_asset(symbol: str):
     return asset, None
 
 
-# --- Routes ------------------------------------------------------------------
+# =============================================================================
+# ROUTES
+# =============================================================================
 
 @app.get("/healthz")
 def healthz():
-    """Liveness probe. Reports which environment is armed, no side effects."""
+    """Liveness probe. Reports the armed environment, no side effects."""
     return jsonify(
         status="ok",
         environment=ENV_LABEL,
@@ -333,11 +362,14 @@ def healthz():
 
 @app.post("/webhook")
 def webhook():
+
+    # --- Size ---------------------------------------------------------------
     if request.content_length and request.content_length > MAX_BODY_BYTES:
         return _bad_request("Payload too large", 413)
 
-    # Parse from raw bytes. TradingView frequently sends the wrong (or no)
-    # Content-Type, so the header is never consulted and cannot cause a 415.
+    # --- Parse --------------------------------------------------------------
+    # Read raw bytes and decode them here. The Content-Type header is never
+    # consulted, so a wrong or absent one cannot cause a 415.
     try:
         raw = request.data.decode("utf-8")
         payload = json.loads(raw)
@@ -357,20 +389,21 @@ def webhook():
         payload.get("action"),
     )
 
-    # --- Auth (constant time) -----------------------------------------------
+    # --- Authentication (constant time) -------------------------------------
     supplied_secret = str(payload.get("secret", ""))
     if not hmac.compare_digest(supplied_secret, WEBHOOK_SECRET):
         logger.warning("Webhook rejected: bad secret")
         return jsonify(error="Unauthorized"), 401
 
-    # Rate limit AFTER auth. Counting unauthenticated requests would let
-    # anyone with the URL starve your own TradingView alerts for the rest of
-    # the window by flooding bad secrets.
+    # --- Rate limit ---------------------------------------------------------
+    # Applied after auth on purpose. Counting unauthenticated requests would
+    # let anyone who knows the URL starve your own alerts for the rest of the
+    # window by flooding bad secrets.
     if _rate_limited(time.monotonic()):
         logger.warning("Webhook rejected: rate limited")
         return jsonify(error="Too many requests"), 429
 
-    # --- Validate -----------------------------------------------------------
+    # --- Extract ------------------------------------------------------------
     raw_symbol = str(payload.get("symbol", ""))
     symbol = normalize_symbol(raw_symbol)
     action = str(payload.get("action", "")).strip().upper()
@@ -379,6 +412,7 @@ def webhook():
     if raw_symbol and raw_symbol.strip().upper() != symbol:
         logger.info("Symbol normalized: %s -> %s", raw_symbol, symbol)
 
+    # --- Validate -----------------------------------------------------------
     if not signal_id:
         return _bad_request("signal_id is required")
 
@@ -414,16 +448,17 @@ def webhook():
 
     client_order_id = make_client_order_id(signal_id)
 
-    # --- Idempotency: exactly two outcomes, no fall-through -----------------
-    # A lookup that fails ambiguously must NOT continue into submission, or an
-    # unknown error becomes a duplicate live order.
+    # --- Duplicate protection ----------------------------------------------
+    # Exactly two outcomes: the order exists, or it definitively does not.
+    # An ambiguous failure returns 502 and must NOT continue into submission,
+    # or an unknown error becomes a duplicate live order.
     try:
         existing = api.get_order_by_client_order_id(client_order_id)
     except APIError as exc:
         if not is_missing_order_error(exc):
             logger.exception("Order lookup failed (ambiguous)")
             return jsonify(error="Order lookup failed"), 502
-        # 404 -> definitively absent -> safe to submit below.
+        # 404: definitively absent, so submission below is safe.
     except Exception:
         logger.exception("Order lookup failed (ambiguous)")
         return jsonify(error="Order lookup failed"), 502
@@ -489,6 +524,10 @@ def webhook():
         return jsonify(error="Order submission failed"), 502
 
 
+# =============================================================================
+# ENTRYPOINT
+# =============================================================================
+
 if __name__ == "__main__":
     logger.info(
         "Starting webhook: environment=%s symbols=%d",
@@ -496,14 +535,3 @@ if __name__ == "__main__":
         len(ALLOWED_SYMBOLS),
     )
     app.run(host="0.0.0.0", port=int(_optional_env("PORT") or "5000"))
-That's the complete file — imports through entrypoint, nothing elided. It's also saved at outputs/app.py if you'd rather download it.
-
-Two things to install and set before running:
-
-bash
-
-
-pip install flask alpaca-py
-export ALPACA_API_KEY=... ALPACA_SECRET_KEY=... WEBHOOK_SECRET=...
-python app.py
-Leave ALPACA_PAPER unset for paper mode. It's Sunday, so an equity alert returns 409 Market is closed while crypto fills — the clock gate behaving correctly.
