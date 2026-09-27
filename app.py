@@ -1,31 +1,3 @@
-"""
-TradingView -> Alpaca webhook application.
-
-Receives TradingView alert payloads, validates them, and submits market
-orders to Alpaca. The account (paper vs live) is chosen by ALPACA_PAPER.
-
-Deployment notes
-----------------
-* The request body is parsed from raw bytes rather than through Flask's JSON
-  helper, so TradingView's wrong or missing Content-Type header cannot produce
-  a 415. Flask's parser refuses anything that is not application/json;
-  TradingView frequently sends text/plain or nothing at all.
-* The shared secret is never written to the logs. Do not re-add a raw-body or
-  header dump: the body carries the credential.
-* Crypto trades 24/7 and uses GTC with fractional quantity; equities are
-  session-bound, DAY, whole shares. Both live in this one code path.
-
-Required environment:
-    ALPACA_API_KEY           (or ALPACA_PAPER_API_KEY / ALPACA_LIVE_API_KEY)
-    ALPACA_SECRET_KEY        (or the per-environment equivalents)
-    WEBHOOK_SECRET           must match the value in the TradingView payload
-
-Optional environment:
-    ALPACA_PAPER             "false" disables paper mode; anything else is paper
-    ALLOWED_SYMBOLS          comma-separated override of the built-in allowlist
-    PORT                     listen port, default 5000
-"""
-
 import hashlib
 import hmac
 import json
