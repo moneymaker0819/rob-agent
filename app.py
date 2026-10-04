@@ -1,4 +1,5 @@
 import hmac
+import json
 import logging
 import os
 import re
@@ -15,19 +16,54 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+PAPER_BASE_URL = "[paper-api.alpaca.markets](https://paper-api.alpaca.markets)"
+LIVE_BASE_URL = "[api.alpaca.markets](https://api.alpaca.markets)"
+
 ALPACA_KEY = os.getenv("APCA_API_KEY_ID", "").strip()
 ALPACA_SECRET = os.getenv("APCA_API_SECRET_KEY", "").strip()
 WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "").strip()
-ALPACA_BASE_URL = os.getenv(
-    "APCA_API_BASE_URL",
-    "https://paper-api.alpaca.markets",
-).strip()
+
+# TRADING_MODE: "paper" (default) or "live".
+TRADING_MODE = os.getenv("TRADING_MODE", "paper").strip().lower()
+if TRADING_MODE not in {"paper", "live"}:
+    raise ValueError("TRADING_MODE must be 'paper' or 'live'")
+
+# Explicit override wins; otherwise the base URL follows TRADING_MODE.
+ALPACA_BASE_URL = os.getenv("APCA_API_BASE_URL", "").strip() or (
+    LIVE_BASE_URL if TRADING_MODE == "live" else PAPER_BASE_URL
+)
+
+# Refuse to start on a mismatched combination.
+if TRADING_MODE == "live" and ALPACA_BASE_URL.rstrip("/") == PAPER_BASE_URL:
+    raise ValueError("TRADING_MODE=live but APCA_API_BASE_URL points at paper")
+if TRADING_MODE == "paper" and ALPACA_BASE_URL.rstrip("/") == LIVE_BASE_URL:
+    raise ValueError("TRADING_MODE=paper but APCA_API_BASE_URL points at live")
+
+# Reduce the chance of live orders during testing: require an explicit opt-in.
+LIVE_CONFIRMED = os.getenv("LIVE_TRADING_CONFIRMED", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
+if TRADING_MODE == "live" and not LIVE_CONFIRMED:
+    raise ValueError(
+        "TRADING_MODE=live requires LIVE_TRADING_CONFIRMED=true"
+    )
 
 ALLOWED_SYMBOLS = {
     symbol.strip().upper()
     for symbol in os.getenv("ALLOWED_SYMBOLS", "SPY,QQQ").split(",")
     if symbol.strip()
 }
+
+# Live orders are bigger than paper orders - keep the size configurable.
+try:
+    ORDER_QTY = int(os.getenv("ORDER_QTY", "1"))
+except ValueError:
+    raise ValueError("ORDER_QTY must be an integer")
+
+if ORDER_QTY < 1:
+    raise ValueError("ORDER_QTY must be at least 1")
 
 api = (
     tradeapi.REST(
@@ -38,6 +74,14 @@ api = (
     )
     if ALPACA_KEY and ALPACA_SECRET
     else None
+)
+
+logger.info(
+    "Rob Agent starting: mode=%s base_url=%s qty=%d symbols=%s",
+    TRADING_MODE,
+    ALPACA_BASE_URL,
+    ORDER_QTY,
+    ",".join(sorted(ALLOWED_SYMBOLS)),
 )
 
 
@@ -57,12 +101,41 @@ def is_missing_order_error(exc: APIError) -> bool:
     return "order not found" in error_text or "not found" in error_text
 
 
+def parse_webhook_payload() -> dict | None:
+    """Accept a JSON object sent as text/plain, application/json, or a raw JSON string.
+
+    TradingView always posts with Content-Type: text/plain, so the raw body is
+    decoded and parsed here rather than relying on request.get_json(), which
+    would reject the request and return 415.
+    """
+    raw = request.get_data(as_text=True) or ""
+    raw = raw.strip()
+    if not raw:
+        return None
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+    # TradingView can deliver the JSON object as a quoted string.
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+    return payload if isinstance(payload, dict) else None
+
+
 @app.get("/")
 def home():
     return jsonify(
         service="Rob Agent",
         status="running",
-        mode="paper",
+        mode=TRADING_MODE,
+        base_url=ALPACA_BASE_URL,
+        qty=ORDER_QTY,
     ), 200
 
 
@@ -78,7 +151,8 @@ def health():
         account = api.get_account()
         return jsonify(
             status="healthy",
-            mode="paper",
+            mode=TRADING_MODE,
+            base_url=ALPACA_BASE_URL,
             account_status=str(account.status),
         ), 200
     except Exception:
@@ -95,11 +169,8 @@ def webhook():
         logger.error("Required environment variables are missing")
         return jsonify(error="Server configuration error"), 503
 
-    if not request.is_json:
-        return jsonify(error="Content-Type must be application/json"), 415
-
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
+    payload = parse_webhook_payload()
+    if payload is None:
         return jsonify(error="Invalid JSON payload"), 400
 
     # TradingView can send this value in the JSON body. Avoid logging it.
@@ -132,7 +203,7 @@ def webhook():
         existing_order = api.get_order_by_client_order_id(client_order_id)
         return jsonify(
             status="duplicate",
-            mode="paper",
+            mode=TRADING_MODE,
             symbol=symbol,
             order_id=str(existing_order.id),
             order_status=str(existing_order.status),
@@ -165,7 +236,7 @@ def webhook():
 
         order = api.submit_order(
             symbol=symbol,
-            qty=1,
+            qty=ORDER_QTY,
             side="buy",
             type="market",
             time_in_force="day",
@@ -173,24 +244,31 @@ def webhook():
         )
 
         logger.info(
-            "Paper order submitted: symbol=%s order_id=%s client_order_id=%s",
+            "%s order submitted: symbol=%s qty=%d order_id=%s client_order_id=%s",
+            TRADING_MODE,
             symbol,
+            ORDER_QTY,
             order.id,
             client_order_id,
         )
 
         return jsonify(
             status="submitted",
-            mode="paper",
+            mode=TRADING_MODE,
             symbol=symbol,
+            qty=ORDER_QTY,
             order_id=str(order.id),
             client_order_id=client_order_id,
         ), 202
     except APIError:
-        logger.exception("Alpaca rejected the paper order for %s", symbol)
+        logger.exception(
+            "Alpaca rejected the %s order for %s", TRADING_MODE, symbol
+        )
         return jsonify(error="Order was rejected by Alpaca"), 502
     except Exception:
-        logger.exception("Paper order submission failed for %s", symbol)
+        logger.exception(
+            "%s order submission failed for %s", TRADING_MODE, symbol
+        )
         return jsonify(error="Order submission failed"), 502
 
 
@@ -200,3 +278,4 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "5000")),
         debug=False,
     )
+
